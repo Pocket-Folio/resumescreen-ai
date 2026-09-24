@@ -1,0 +1,22 @@
+# Adds a Caddy reverse proxy with automatic Let's Encrypt HTTPS.
+# Requirements: a DNS name (DOMAIN in .env) pointing at the EC2 instance, ports 80 and 443 open,
+# and APP_BIND=127.0.0.1 / APP_PORT=8080 / COOKIE_SECURE=true in .env.
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:
