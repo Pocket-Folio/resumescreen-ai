@@ -94,3 +94,250 @@ jobs:
           chmod 600 "${HOME}/.ssh/known_hosts"
 
       - name: Test EC2 SSH connection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/ec2.pem" \
+            -p "${EC2_PORT}" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "${EC2_USER}@${EC2_HOST}" \
+            '
+              echo "SSH CONNECTION SUCCESSFUL"
+              docker --version
+              docker compose version
+              df -h /
+            '
+
+      - name: Copy deployment files to EC2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scp \
+            -i "${HOME}/.ssh/ec2.pem" \
+            -P "${EC2_PORT}" \
+            "/tmp/${IMAGE_NAME}.tar.gz" \
+            docker-compose.yml \
+            "${EC2_USER}@${EC2_HOST}:/tmp/"
+
+          echo "Deployment files copied successfully."
+
+      - name: Deploy ResumeScreen AI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/ec2.pem" \
+            -p "${EC2_PORT}" \
+            "${EC2_USER}@${EC2_HOST}" \
+            'bash -se' <<'REMOTE_SCRIPT'
+
+          set -Eeuo pipefail
+
+          APP_DIR="/opt/resumescreen-ai/current"
+          IMAGE_NAME="resumescreen-ai"
+
+          echo "=================================================="
+          echo "       ResumeScreen AI Deployment"
+          echo "=================================================="
+
+          mkdir -p "${APP_DIR}"
+          cd "${APP_DIR}"
+
+          cat > "${APP_DIR}/.env" <<'ENV_FILE'
+          APP_PASSWORD=ResumeScreen@Practice2026!
+          ANTHROPIC_API_KEY=
+          CLAUDE_MODEL=claude-opus-5
+          SESSION_SECRET=
+          COOKIE_SECURE=false
+          ALLOW_UNAUTHENTICATED=false
+          MAX_UPLOAD_MB=10
+          APP_BIND=0.0.0.0
+          APP_PORT=80
+          CLAUDE_REFUSAL_FALLBACKS=true
+          ANTHROPIC_WORKSPACE_ID=
+          ENV_FILE
+
+          chmod 600 "${APP_DIR}/.env"
+
+          mv /tmp/docker-compose.yml \
+             "${APP_DIR}/docker-compose.yml"
+
+          echo
+          echo "=== Docker version ==="
+          docker --version
+
+          echo
+          echo "=== Docker Compose version ==="
+          docker compose version
+
+          echo
+          echo "=== Disk before deployment ==="
+          df -h /
+
+          docker image prune -f || true
+
+          if docker image inspect \
+            "${IMAGE_NAME}:latest" >/dev/null 2>&1; then
+
+            echo
+            echo "Saving current image as rollback image..."
+
+            docker image rm \
+              "${IMAGE_NAME}:previous" \
+              >/dev/null 2>&1 || true
+
+            docker tag \
+              "${IMAGE_NAME}:latest" \
+              "${IMAGE_NAME}:previous"
+          fi
+
+          echo
+          echo "Loading new Docker image..."
+
+          gunzip -c "/tmp/${IMAGE_NAME}.tar.gz" \
+            | docker load
+
+          rm -f "/tmp/${IMAGE_NAME}.tar.gz"
+
+          echo
+          echo "Starting ResumeScreen AI..."
+
+          docker compose up \
+            -d \
+            --no-build \
+            --force-recreate \
+            --remove-orphans
+
+          echo
+          echo "Waiting for application to become healthy..."
+
+          DEPLOYMENT_OK="false"
+
+          for attempt in $(seq 1 36); do
+
+            CONTAINER_ID="$(docker compose ps -q app)"
+
+            if [ -n "${CONTAINER_ID}" ]; then
+
+              STATUS="$(
+                docker inspect \
+                  --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                  "${CONTAINER_ID}" \
+                  2>/dev/null || true
+              )"
+
+              echo "Attempt ${attempt}/36 -> ${STATUS:-starting}"
+
+              if [ "${STATUS}" = "healthy" ]; then
+                DEPLOYMENT_OK="true"
+                break
+              fi
+
+              if [ "${STATUS}" = "unhealthy" ] || \
+                 [ "${STATUS}" = "exited" ] || \
+                 [ "${STATUS}" = "dead" ]; then
+                break
+              fi
+
+            else
+              echo "Attempt ${attempt}/36 -> container not created yet"
+            fi
+
+            sleep 5
+          done
+
+          if [ "${DEPLOYMENT_OK}" != "true" ]; then
+
+            echo
+            echo "=================================================="
+            echo "              DEPLOYMENT FAILED"
+            echo "=================================================="
+
+            docker compose ps || true
+
+            echo
+            echo "=== Application logs ==="
+
+            docker compose logs \
+              --tail=200 \
+              app || true
+
+            if docker image inspect \
+              "${IMAGE_NAME}:previous" >/dev/null 2>&1; then
+
+              echo
+              echo "Rolling back previous Docker image..."
+
+              docker tag \
+                "${IMAGE_NAME}:previous" \
+                "${IMAGE_NAME}:latest"
+
+              docker compose up \
+                -d \
+                --no-build \
+                --force-recreate \
+                --remove-orphans
+
+              echo
+              echo "Rollback container status:"
+              docker compose ps || true
+
+            else
+              echo
+              echo "No previous image exists."
+              echo "This appears to be the first deployment."
+            fi
+
+            exit 1
+          fi
+
+          echo
+          echo "=== API health check ==="
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1/api/health
+
+          echo
+
+          echo
+          echo "=== Docker Compose status ==="
+          docker compose ps
+
+          echo
+          echo "=== Running containers ==="
+          docker ps
+
+          echo
+          echo "=== Persistent volume ==="
+          docker volume inspect resumescreen-data \
+            --format 'Name={{.Name}} Mountpoint={{.Mountpoint}}'
+
+          echo
+          echo "=== Disk after deployment ==="
+          df -h /
+
+          echo
+          echo "=================================================="
+          echo "       DEPLOYMENT SUCCESSFUL"
+          echo "       http://54.254.237.169"
+          echo "=================================================="
+
+          REMOTE_SCRIPT
+
+      - name: Deployment completed
+        if: success()
+        shell: bash
+        run: |
+          echo "=============================================="
+          echo "ResumeScreen AI deployed successfully"
+          echo "URL: http://${EC2_HOST}"
+          echo "EC2 user: ${EC2_USER}"
+          echo "=============================================="
